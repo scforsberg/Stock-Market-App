@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: alphavantage-explorer
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: ALPHAVANTAGE_API_KEY
+        sync: false
