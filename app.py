@@ -1,294 +1,491 @@
 from __future__ import annotations
 
-import json
 import os
-from io import StringIO
-from urllib.parse import urlencode
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Any
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-QUERY_BASE_URL = "https://www.alphavantage.co/query"
-ANALYTICS_BASE_URL = "https://alphavantageapi.co/timeseries/analytics"
+TRADING_LIVE = "https://api.alpaca.markets"
+TRADING_PAPER = "https://paper-api.alpaca.markets"
+DATA_BASE = "https://data.alpaca.markets"
 
-FUNCTIONS = {
-    "Time Series": [
-        "TIME_SERIES_INTRADAY","TIME_SERIES_DAILY","TIME_SERIES_DAILY_ADJUSTED",
-        "TIME_SERIES_WEEKLY","TIME_SERIES_WEEKLY_ADJUSTED","TIME_SERIES_MONTHLY",
-        "TIME_SERIES_MONTHLY_ADJUSTED","GLOBAL_QUOTE","SYMBOL_SEARCH","MARKET_STATUS",
-    ],
-    "Options & Intelligence": [
-        "HISTORICAL_OPTIONS","NEWS_SENTIMENT","TOP_GAINERS_LOSERS","INSIDER_TRANSACTIONS",
-        "ANALYTICS_FIXED_WINDOW","ANALYTICS_SLIDING_WINDOW",
-    ],
-    "Fundamentals": [
-        "OVERVIEW","INCOME_STATEMENT","BALANCE_SHEET","CASH_FLOW","EARNINGS",
-        "LISTING_STATUS","EARNINGS_CALENDAR","IPO_CALENDAR",
-    ],
-    "Forex & Crypto": [
-        "FX_INTRADAY","FX_DAILY","FX_WEEKLY","FX_MONTHLY","CURRENCY_EXCHANGE_RATE",
-        "CRYPTO_INTRADAY","DIGITAL_CURRENCY_DAILY","DIGITAL_CURRENCY_WEEKLY","DIGITAL_CURRENCY_MONTHLY",
-    ],
-    "Economics & Commodities": [
-        "REAL_GDP","REAL_GDP_PER_CAPITA","TREASURY_YIELD","FEDERAL_FUNDS_RATE","CPI","INFLATION",
-        "RETAIL_SALES","DURABLES","UNEMPLOYMENT","NONFARM_PAYROLL",
-        "WTI","BRENT","NATURAL_GAS","COPPER","ALUMINUM","WHEAT","CORN","COTTON","SUGAR","COFFEE",
-        "ALL_COMMODITIES","REALTIME_BULK_QUOTES","XAU_USD","XAG_USD","XAU_EUR","XAG_EUR",
-    ],
-    "Technical Indicators": [
-        "SMA","EMA","WMA","DEMA","TEMA","TRIMA","KAMA","MAMA","VWAP","T3",
-        "MACD","MACDEXT","STOCH","STOCHF","RSI","STOCHRSI","WILLR","ADX","ADXR",
-        "APO","PPO","MOM","BOP","CCI","CMO","ROC","ROCR","AROON","AROONOSC",
-        "MFI","TRIX","ULTOSC","DX","MINUS_DI","PLUS_DI","MINUS_DM","PLUS_DM",
-        "BBANDS","MIDPOINT","MIDPRICE","SAR","TRANGE","ATR","NATR","AD","ADOSC",
-        "OBV","HT_TRENDLINE","HT_SINE","HT_TRENDMODE","HT_DCPERIOD","HT_DCPHASE","HT_PHASOR",
-    ],
-}
 
-PRESETS = {
-    "symbol": "IBM",
-    "interval": "5min",
-    "outputsize": "compact",
-    "datatype": "json",
-    "adjusted": "true",
-    "entitlement": "realtime",
-    "series_type": "close",
-    "time_period": "14",
-    "from_symbol": "EUR",
-    "to_symbol": "USD",
-    "from_currency": "BTC",
-    "to_currency": "USD",
-    "market": "USD",
-    "horizon": "3month",
-    "apikey": "",
-}
+@dataclass
+class AlpacaConfig:
+    key_id: str
+    secret_key: str
+    paper: bool = True
 
-def flatten_json(payload: object) -> pd.DataFrame | None:
-    if isinstance(payload, list) and payload and all(isinstance(x, dict) for x in payload):
-        return pd.DataFrame(payload)
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            if isinstance(value, dict):
-                values = list(value.values())
-                if values and all(isinstance(v, dict) for v in values):
-                    df = pd.DataFrame.from_dict(value, orient="index")
-                    try:
-                        idx = pd.to_datetime(df.index, errors="coerce")
-                        if idx.notna().mean() > 0.6:
-                            df.index = idx
-                            df = df.sort_index()
-                    except Exception:
-                        pass
-                    for col in df.columns:
-                        try:
-                            num = pd.to_numeric(df[col], errors="coerce")
-                            if num.notna().mean() > 0.6:
-                                df[col] = num
-                        except Exception:
-                            pass
-                    return df
-        scalars = {k: v for k, v in payload.items() if isinstance(v, (str, int, float, bool)) or v is None}
-        if scalars:
-            return pd.DataFrame([scalars])
-    return None
+    @property
+    def trading_base(self) -> str:
+        return TRADING_PAPER if self.paper else TRADING_LIVE
 
-def build_request(function_name: str, params: dict[str, str], api_key: str) -> tuple[str, list[tuple[str, str]]]:
-    clean = [(k, str(v)) for k, v in params.items() if str(v).strip()]
-    if function_name == "ANALYTICS_FIXED_WINDOW":
-        base = ANALYTICS_BASE_URL
-        payload = [(k.upper(), v) for k, v in clean if k != "apikey"]
-        payload.append(("apikey", api_key))
-        return base, payload
-    if function_name == "ANALYTICS_SLIDING_WINDOW":
-        base = ANALYTICS_BASE_URL
-        payload = [(k.upper(), v) for k, v in clean if k != "apikey"]
-        payload.append(("apikey", api_key))
-        return base, payload
-    base = QUERY_BASE_URL
-    payload = [("function", function_name)] + [(k, v) for k, v in clean if k != "apikey"] + [("apikey", api_key)]
-    return base, payload
+    @property
+    def headers(self) -> dict[str, str]:
+        return {
+            "APCA-API-KEY-ID": self.key_id,
+            "APCA-API-SECRET-KEY": self.secret_key,
+            "accept": "application/json",
+        }
 
-def make_request(function_name: str, params: dict[str, str], api_key: str):
-    base, payload = build_request(function_name, params, api_key)
-    resp = requests.get(base, params=payload, timeout=45)
-    resp.raise_for_status()
-    if params.get("datatype") == "csv" or "csv" in resp.headers.get("content-type", "").lower():
-        df = pd.read_csv(StringIO(resp.text))
-        return resp.url, df, resp.text
-    data = resp.json()
-    if isinstance(data, dict):
-        for key in ("Error Message", "Information", "Note"):
-            if data.get(key):
-                raise RuntimeError(str(data[key]))
-    return resp.url, data, json.dumps(data, indent=2)
 
-st.set_page_config(page_title="Alpha Vantage Explorer", page_icon="📈", layout="wide")
+class AlpacaClient:
+    def __init__(self, config: AlpacaConfig) -> None:
+        self.config = config
 
-st.markdown("""
-<style>
-.block-container{padding-top:1rem;padding-bottom:2rem;}
-.hero{padding:1.3rem 1.4rem;border-radius:20px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 40%,#2563eb 100%);color:white;box-shadow:0 18px 48px rgba(15,23,42,.18);margin-bottom:1rem}
-.card{padding:1rem;border-radius:18px;border:1px solid rgba(148,163,184,.18);background:rgba(255,255,255,.85);box-shadow:0 10px 25px rgba(15,23,42,.05)}
-.small{color:#64748b;font-size:.92rem}
-</style>
-""", unsafe_allow_html=True)
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> Any:
+        cleaned_params = {k: v for k, v in (params or {}).items() if v not in ("", None, [])}
+        cleaned_json = {k: v for k, v in (json or {}).items() if v not in ("", None, [])}
 
-st.markdown("""
-<div class="hero">
-  <h1 style="margin:0;">Alpha Vantage Explorer</h1>
-  <p style="margin:.35rem 0 0 0;">Hosted-ready Streamlit app for querying Alpha Vantage across market data, fundamentals, macro data, commodities, forex, crypto, technical indicators, and analytics endpoints from one clean interface.</p>
-</div>
-""", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("Alpha Vantage API key", value=os.getenv("ALPHAVANTAGE_API_KEY", ""), type="password")
-    family = st.selectbox("API family", list(FUNCTIONS.keys()))
-    function_name = st.selectbox("Function", FUNCTIONS[family])
-    st.caption("You can also override any parameter in the JSON box below for edge cases and less common endpoints.")
-
-left, right = st.columns([1.2, 1])
-
-with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Request builder")
-    params = {}
-    c1, c2 = st.columns(2)
-    with c1:
-        params["symbol"] = st.text_input("symbol", PRESETS["symbol"])
-        params["interval"] = st.selectbox("interval", ["1min","5min","15min","30min","60min","daily","weekly","monthly"], index=1)
-        params["outputsize"] = st.selectbox("outputsize", ["compact", "full"], index=0)
-        params["datatype"] = st.selectbox("datatype", ["json", "csv"], index=0)
-        params["series_type"] = st.selectbox("series_type", ["close", "open", "high", "low"], index=0)
-        params["time_period"] = st.text_input("time_period", PRESETS["time_period"])
-    with c2:
-        params["from_symbol"] = st.text_input("from_symbol", PRESETS["from_symbol"])
-        params["to_symbol"] = st.text_input("to_symbol", PRESETS["to_symbol"])
-        params["from_currency"] = st.text_input("from_currency", PRESETS["from_currency"])
-        params["to_currency"] = st.text_input("to_currency", PRESETS["to_currency"])
-        params["market"] = st.text_input("market", PRESETS["market"])
-        params["horizon"] = st.text_input("horizon", PRESETS["horizon"])
-
-    raw_json = st.text_area(
-        "Advanced JSON overrides",
-        value=json.dumps({
-            "month": "",
-            "adjusted": "true",
-            "extended_hours": "true",
-            "entitlement": "realtime",
-            "range": "2024-01-01",
-            "calculations": "MEAN,STDDEV,CORRELATION",
-            "window_size": "10",
-            "ohlc": "close",
-            "symbols": "IBM,MSFT"
-        }, indent=2),
-        height=220,
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with right:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("What this covers")
-    st.markdown("""
-- Stocks and time series  
-- Options and Alpha Intelligence  
-- Fundamentals and calendars  
-- Forex and crypto  
-- Macro and commodities  
-- Technical indicators  
-- Analytics endpoints  
-""")
-    st.markdown('<div class="small">For uncommon or premium endpoints, put the exact parameters in the override box and the app will send them through directly.</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-try:
-    overrides = json.loads(raw_json) if raw_json.strip() else {}
-    if not isinstance(overrides, dict):
-        overrides = {}
-except Exception:
-    overrides = {}
-    st.warning("Advanced JSON overrides could not be parsed. Using the form fields only.")
-
-merged = {**params, **overrides}
-merged = {k: v for k, v in merged.items() if str(v).strip()}
-
-c1, c2 = st.columns([1, 2])
-with c1:
-    run = st.button("Run request", type="primary", use_container_width=True)
-with c2:
-    if api_key:
-        base, payload = build_request(function_name, merged, api_key)
-        st.code(f"{base}?{urlencode(payload, doseq=True)}", language="text")
-
-if run:
-    if not api_key:
-        st.error("Enter your Alpha Vantage API key in the sidebar.")
-    else:
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=self.config.headers,
+            params=cleaned_params or None,
+            json=cleaned_json or None,
+            timeout=45,
+        )
+        if response.status_code == 204:
+            return {"status": "ok", "status_code": 204}
         try:
-            url, payload, raw = make_request(function_name, merged, api_key)
-            st.success("Request completed.")
-            st.caption(url)
+            payload = response.json()
+        except Exception:
+            payload = {"raw_text": response.text}
 
-            tabs = st.tabs(["Table", "Chart", "Raw payload", "Downloads"])
-            with tabs[0]:
-                if isinstance(payload, pd.DataFrame):
-                    df = payload
-                else:
-                    df = flatten_json(payload)
-                if df is not None and not df.empty:
-                    st.dataframe(df, use_container_width=True)
-                else:
-                    st.json(payload)
+        if not response.ok:
+            raise RuntimeError(f"{response.status_code}: {payload}")
+        return payload
 
-            with tabs[1]:
-                if isinstance(payload, pd.DataFrame):
-                    df = payload
-                else:
-                    df = flatten_json(payload)
-                if df is not None and not df.empty:
-                    numeric_cols = list(df.select_dtypes(include="number").columns)
-                    if numeric_cols:
-                        default = numeric_cols[: min(3, len(numeric_cols))]
-                        selected = st.multiselect("Metrics", numeric_cols, default=default)
-                        chart_df = df.copy()
-                        if not isinstance(chart_df.index, pd.DatetimeIndex):
-                            for col in chart_df.columns:
-                                try:
-                                    dt = pd.to_datetime(chart_df[col], errors="coerce")
-                                    if dt.notna().mean() > 0.6:
-                                        chart_df = chart_df.set_index(col)
-                                        break
-                                except Exception:
-                                    pass
-                        if selected:
-                            st.line_chart(chart_df[selected])
-                        else:
-                            st.info("Select at least one numeric metric.")
-                    else:
-                        st.info("No numeric columns were detected for charting.")
-                else:
-                    st.info("No table-like data was detected for charting.")
+    def trading_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request("GET", f"{self.config.trading_base}{path}", params=params)
 
-            with tabs[2]:
-                if isinstance(payload, pd.DataFrame):
-                    st.code(payload.to_json(orient="records", indent=2), language="json")
-                else:
-                    st.code(raw, language="json")
+    def trading_post(self, path: str, payload: dict[str, Any]) -> Any:
+        return self._request("POST", f"{self.config.trading_base}{path}", json=payload)
 
-            with tabs[3]:
-                if isinstance(payload, pd.DataFrame):
-                    csv_bytes = payload.to_csv(index=False).encode("utf-8")
-                    st.download_button("Download CSV", csv_bytes, "alphavantage_data.csv", "text/csv")
-                    st.download_button("Download JSON", payload.to_json(orient="records", indent=2), "alphavantage_data.json", "application/json")
-                else:
-                    df = flatten_json(payload)
-                    if df is not None and not df.empty:
-                        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "alphavantage_data.csv", "text/csv")
-                    st.download_button("Download JSON", raw, "alphavantage_data.json", "application/json")
+    def trading_delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request("DELETE", f"{self.config.trading_base}{path}", params=params)
 
-        except Exception as exc:
-            st.error(str(exc))
+    def data_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request("GET", f"{DATA_BASE}{path}", params=params)
+
+
+def to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+    for col in df.columns:
+        if df[col].isna().all():
+            continue
+        first = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+        if isinstance(first, (dict, list)):
+            continue
+        maybe_dt = pd.to_datetime(df[col], errors="coerce", utc=True)
+        if maybe_dt.notna().mean() > 0.8:
+            df[col] = maybe_dt
+            continue
+        maybe_num = pd.to_numeric(df[col], errors="coerce")
+        if maybe_num.notna().mean() > 0.8:
+            df[col] = maybe_num
+    return df
+
+
+def bars_to_df(payload: dict[str, Any], symbol: str) -> pd.DataFrame:
+    bars = payload.get("bars", [])
+    if isinstance(bars, dict):
+        bars = bars.get(symbol, [])
+    df = to_dataframe(bars)
+    if "t" in df.columns:
+        df["t"] = pd.to_datetime(df["t"], utc=True)
+        df = df.sort_values("t")
+    return df
+
+
+def portfolio_to_df(payload: dict[str, Any]) -> pd.DataFrame:
+    timestamps = payload.get("timestamp", [])
+    if not timestamps:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(payload.get("timestamp", []), unit="s", utc=True),
+            "equity": payload.get("equity", []),
+            "profit_loss": payload.get("profit_loss", []),
+            "profit_loss_pct": payload.get("profit_loss_pct", []),
+        }
+    )
+
+
+def metric_card(label: str, value: Any, delta: Any | None = None) -> None:
+    st.metric(label=label, value=value, delta=delta)
+
+
+def normalize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    latest_trade = snapshot.get("latestTrade", {})
+    latest_quote = snapshot.get("latestQuote", {})
+    minute_bar = snapshot.get("minuteBar", {})
+    daily_bar = snapshot.get("dailyBar", {})
+    prev_bar = snapshot.get("prevDailyBar", {})
+    return {
+        "trade_price": latest_trade.get("p"),
+        "trade_size": latest_trade.get("s"),
+        "bid_price": latest_quote.get("bp"),
+        "ask_price": latest_quote.get("ap"),
+        "minute_close": minute_bar.get("c"),
+        "daily_close": daily_bar.get("c"),
+        "prev_close": prev_bar.get("c"),
+        "daily_volume": daily_bar.get("v"),
+    }
+
+
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container{padding-top:1rem;padding-bottom:2rem;max-width:1500px;}
+        .hero{
+            padding:1.35rem 1.4rem;border-radius:22px;
+            background:linear-gradient(135deg,#0b1220 0%,#13233d 45%,#1d4ed8 100%);
+            color:white;box-shadow:0 18px 48px rgba(15,23,42,.22);margin-bottom:1rem
+        }
+        .warning{
+            padding:.85rem 1rem;border-radius:16px;background:#fff7ed;border:1px solid #fdba74;color:#9a3412
+        }
+        .ok{
+            padding:.85rem 1rem;border-radius:16px;background:#ecfeff;border:1px solid #67e8f9;color:#155e75
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar() -> tuple[AlpacaClient | None, bool]:
+    with st.sidebar:
+        st.header("Connection")
+        mode = st.radio("Trading mode", ["Paper", "Live"], horizontal=True, index=0)
+        key_id = st.text_input("Alpaca API Key ID", value=os.getenv("ALPACA_API_KEY_ID", ""), type="password")
+        secret_key = st.text_input("Alpaca Secret Key", value=os.getenv("ALPACA_API_SECRET_KEY", ""), type="password")
+        st.caption("Market data uses the same key/secret headers. Paper mode is the safer default.")
+        can_trade = st.checkbox("Enable order entry controls", value=False)
+        if mode == "Live":
+            st.markdown('<div class="warning">Live mode can route real orders. Keep this off until you have confirmed your credentials and workflow.</div>', unsafe_allow_html=True)
+
+    if not key_id or not secret_key:
+        return None, can_trade
+
+    config = AlpacaConfig(key_id=key_id, secret_key=secret_key, paper=(mode == "Paper"))
+    return AlpacaClient(config), can_trade
+
+
+def dashboard_tab(client: AlpacaClient) -> None:
+    st.subheader("Account dashboard")
+    left, right = st.columns([1.2, 1])
+    account = client.trading_get("/v2/account")
+    clock = client.trading_get("/v2/clock")
+    portfolio = client.trading_get("/v2/account/portfolio/history", params={"period": "1M", "timeframe": "1D"})
+
+    with left:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            metric_card("Equity", account.get("equity"))
+        with c2:
+            metric_card("Buying Power", account.get("buying_power"))
+        with c3:
+            metric_card("Cash", account.get("cash"))
+        with c4:
+            metric_card("PDT Flag", str(account.get("pattern_day_trader")))
+
+        status_label = "Open" if clock.get("is_open") else "Closed"
+        st.markdown(
+            f'<div class="ok">Market status: <strong>{status_label}</strong> · Next open: {clock.get("next_open")} · Next close: {clock.get("next_close")}</div>',
+            unsafe_allow_html=True,
+        )
+
+        pdf = portfolio_to_df(portfolio)
+        if not pdf.empty:
+            fig = px.line(pdf, x="timestamp", y="equity", title="Portfolio equity")
+            fig.update_layout(height=360, margin=dict(l=20, r=20, t=50, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pdf, use_container_width=True, height=220)
+        else:
+            st.info("No portfolio history returned for the selected account.")
+    with right:
+        st.markdown("#### Account details")
+        details = {
+            "account_number": account.get("account_number"),
+            "status": account.get("status"),
+            "currency": account.get("currency"),
+            "multiplier": account.get("multiplier"),
+            "daytrade_count": account.get("daytrade_count"),
+            "trading_blocked": account.get("trading_blocked"),
+            "transfers_blocked": account.get("transfers_blocked"),
+            "account_blocked": account.get("account_blocked"),
+        }
+        st.json(details)
+        st.markdown("#### Market clock")
+        st.json(clock)
+
+
+def market_data_tab(client: AlpacaClient) -> None:
+    st.subheader("Market data")
+    symbol = st.text_input("Symbol", value="AAPL").upper().strip() or "AAPL"
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        timeframe = st.selectbox("Bar timeframe", ["1Min", "5Min", "15Min", "1Hour", "1Day"], index=4)
+    with c2:
+        start_date = st.date_input("Start date", value=date.today() - timedelta(days=30))
+    with c3:
+        end_date = st.date_input("End date", value=date.today())
+
+    snapshot = client.data_get(f"/v2/stocks/{symbol}/snapshot")
+    latest_quote = client.data_get(f"/v2/stocks/{symbol}/quotes/latest")
+    latest_trade = client.data_get(f"/v2/stocks/{symbol}/trades/latest")
+    bars = client.data_get(
+        f"/v2/stocks/{symbol}/bars",
+        params={
+            "timeframe": timeframe,
+            "start": f"{start_date.isoformat()}T00:00:00Z",
+            "end": f"{end_date.isoformat()}T23:59:59Z",
+            "limit": 500,
+            "adjustment": "raw",
+            "feed": "iex",
+        },
+    )
+    news = client.data_get("/v1beta1/news", params={"symbols": symbol, "limit": 10})
+
+    snap = normalize_snapshot(snapshot)
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        metric_card("Last Trade", snap.get("trade_price"))
+    with m2:
+        metric_card("Bid", snap.get("bid_price"))
+    with m3:
+        metric_card("Ask", snap.get("ask_price"))
+    with m4:
+        prev_close = snap.get("prev_close")
+        daily_close = snap.get("daily_close")
+        delta = None
+        if daily_close is not None and prev_close not in (None, 0):
+            delta = f"{((daily_close - prev_close) / prev_close) * 100:.2f}%"
+        metric_card("Daily Close", daily_close, delta)
+
+    bars_df = bars_to_df(bars, symbol)
+    if not bars_df.empty:
+        fig = px.line(bars_df, x="t", y="c", title=f"{symbol} close price")
+        fig.update_layout(height=380, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(bars_df, use_container_width=True, height=260)
+    else:
+        st.info("No bar data returned for that symbol and date range.")
+
+    q1, q2 = st.columns(2)
+    with q1:
+        st.markdown("#### Latest quote")
+        st.json(latest_quote)
+    with q2:
+        st.markdown("#### Latest trade")
+        st.json(latest_trade)
+
+    st.markdown("#### News")
+    news_items = news.get("news", []) if isinstance(news, dict) else news
+    if news_items:
+        news_df = to_dataframe(news_items)
+        show_cols = [c for c in ["headline", "author", "created_at", "symbols", "summary"] if c in news_df.columns]
+        st.dataframe(news_df[show_cols], use_container_width=True, height=300)
+    else:
+        st.info("No recent news returned for this symbol.")
+
+
+def orders_tab(client: AlpacaClient, can_trade: bool) -> None:
+    st.subheader("Orders")
+    list_mode = st.radio("Order list", ["Open", "All"], horizontal=True)
+    status = "open" if list_mode == "Open" else "all"
+    orders = client.trading_get("/v2/orders", params={"status": status, "limit": 100, "direction": "desc"})
+    orders_df = to_dataframe(orders if isinstance(orders, list) else [])
+    if not orders_df.empty:
+        display_cols = [c for c in ["submitted_at", "symbol", "side", "type", "qty", "notional", "limit_price", "status", "id"] if c in orders_df.columns]
+        st.dataframe(orders_df[display_cols], use_container_width=True, height=280)
+    else:
+        st.info("No orders returned.")
+
+    st.markdown("#### Place order")
+    if not can_trade:
+        st.warning("Enable order entry controls in the sidebar before sending orders.")
+        return
+
+    with st.form("place_order"):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            symbol = st.text_input("Symbol", value="AAPL").upper()
+            side = st.selectbox("Side", ["buy", "sell"])
+        with c2:
+            order_type = st.selectbox("Type", ["market", "limit", "stop", "stop_limit"])
+            tif = st.selectbox("Time in force", ["day", "gtc", "ioc", "fok"])
+        with c3:
+            qty = st.text_input("Qty", value="1")
+            notional = st.text_input("Notional (optional)", value="")
+        with c4:
+            limit_price = st.text_input("Limit price", value="")
+            stop_price = st.text_input("Stop price", value="")
+        extended_hours = st.checkbox("Extended hours eligible", value=False)
+        submitted = st.form_submit_button("Submit order", type="primary", use_container_width=True)
+
+    if submitted:
+        payload: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "time_in_force": tif,
+            "extended_hours": extended_hours,
+        }
+        if qty.strip():
+            payload["qty"] = qty.strip()
+        if notional.strip():
+            payload["notional"] = notional.strip()
+        if limit_price.strip():
+            payload["limit_price"] = limit_price.strip()
+        if stop_price.strip():
+            payload["stop_price"] = stop_price.strip()
+
+        response = client.trading_post("/v2/orders", payload)
+        st.success("Order submitted.")
+        st.json(response)
+
+    st.markdown("#### Cancel order")
+    cancel_order_id = st.text_input("Order ID to cancel")
+    if st.button("Cancel selected order", use_container_width=True) and cancel_order_id.strip():
+        response = client.trading_delete(f"/v2/orders/{cancel_order_id.strip()}")
+        st.success("Cancel request accepted.")
+        st.json(response)
+
+    if st.button("Cancel all open orders", use_container_width=True):
+        response = client.trading_delete("/v2/orders")
+        st.success("Cancel-all request submitted.")
+        st.json(response)
+
+
+def positions_tab(client: AlpacaClient) -> None:
+    st.subheader("Positions")
+    positions = client.trading_get("/v2/positions")
+    positions_df = to_dataframe(positions if isinstance(positions, list) else [])
+    if positions_df.empty:
+        st.info("No open positions.")
+        return
+    display_cols = [c for c in ["symbol", "qty", "avg_entry_price", "market_value", "cost_basis", "unrealized_pl", "unrealized_plpc", "side"] if c in positions_df.columns]
+    st.dataframe(positions_df[display_cols], use_container_width=True, height=320)
+    if "market_value" in positions_df.columns:
+        chart_df = positions_df.copy()
+        chart_df["market_value"] = pd.to_numeric(chart_df["market_value"], errors="coerce")
+        fig = px.bar(chart_df, x="symbol", y="market_value", title="Position market value")
+        fig.update_layout(height=360, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def watchlists_tab(client: AlpacaClient, can_trade: bool) -> None:
+    st.subheader("Watchlists")
+    watchlists = client.trading_get("/v2/watchlists")
+    watchlists_df = to_dataframe(watchlists if isinstance(watchlists, list) else [])
+    if not watchlists_df.empty:
+        st.dataframe(watchlists_df[[c for c in ["name", "id", "created_at", "updated_at"] if c in watchlists_df.columns]], use_container_width=True, height=220)
+    else:
+        st.info("No watchlists yet.")
+
+    if can_trade:
+        st.markdown("#### Create watchlist")
+        with st.form("create_watchlist"):
+            name = st.text_input("Watchlist name", value="Core Holdings")
+            symbols_raw = st.text_input("Symbols (comma separated)", value="AAPL,MSFT,NVDA")
+            create = st.form_submit_button("Create watchlist", type="primary", use_container_width=True)
+        if create and name.strip():
+            symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+            response = client.trading_post("/v2/watchlists", {"name": name.strip(), "symbols": symbols})
+            st.success("Watchlist created.")
+            st.json(response)
+    else:
+        st.caption("Enable order entry controls to create watchlists from the app.")
+
+
+def activity_tab(client: AlpacaClient) -> None:
+    st.subheader("Activity and market schedule")
+    c1, c2 = st.columns([1.15, 1])
+    with c1:
+        activities = client.trading_get("/v2/account/activities", params={"page_size": 100})
+        activities_df = to_dataframe(activities if isinstance(activities, list) else [])
+        if not activities_df.empty:
+            cols = [c for c in ["transaction_time", "activity_type", "symbol", "qty", "price", "net_amount", "id"] if c in activities_df.columns]
+            st.dataframe(activities_df[cols], use_container_width=True, height=320)
+        else:
+            st.info("No recent account activity returned.")
+    with c2:
+        start = date.today()
+        end = date.today() + timedelta(days=10)
+        calendar = client.trading_get("/v2/calendar", params={"start": start.isoformat(), "end": end.isoformat()})
+        calendar_df = to_dataframe(calendar if isinstance(calendar, list) else [])
+        if not calendar_df.empty:
+            st.dataframe(calendar_df, use_container_width=True, height=320)
+        else:
+            st.info("No market calendar rows returned.")
+
+
+def landing() -> None:
+    st.markdown(
+        """
+        <div class="hero">
+            <h1 style="margin:0;">Alpaca Trading Console</h1>
+            <p style="margin:.35rem 0 0 0;">
+                Hosted-ready Streamlit app for paper or live Alpaca accounts with account overview,
+                market data, orders, positions, watchlists, portfolio history, and activity in one interface.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Alpaca Trading Console", page_icon="📈", layout="wide")
+    inject_css()
+    landing()
+    client, can_trade = sidebar()
+
+    st.caption("Start in paper mode. The same trading API schema works across paper and live; only the base domain and credentials change.")
+
+    if client is None:
+        st.info("Enter your Alpaca key ID and secret key in the sidebar to connect.")
+        st.stop()
+
+    try:
+        tabs = st.tabs(["Dashboard", "Market Data", "Orders", "Positions", "Watchlists", "Activity"])
+        with tabs[0]:
+            dashboard_tab(client)
+        with tabs[1]:
+            market_data_tab(client)
+        with tabs[2]:
+            orders_tab(client, can_trade)
+        with tabs[3]:
+            positions_tab(client)
+        with tabs[4]:
+            watchlists_tab(client, can_trade)
+        with tabs[5]:
+            activity_tab(client)
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+
+if __name__ == "__main__":
+    main()
